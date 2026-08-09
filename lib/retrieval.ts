@@ -1,72 +1,132 @@
-import type { Chunk, RetrievedSource } from "./types";
+import { sort } from "next/dist/build/webpack/loaders/css-loader/src/utils";
+import type { Chunk, RetrievedSource, ScoredChunk } from "./types";
 
-/** RRF constant (Cormack, Clarke & Büttcher, 2009 — used in Elasticsearch, Pinecone, etc.) */
+/** Reciprocal Rank Fusion constant. */
 const RRF_K = 60;
 
-/** How far below the top fused score a passage may fall and still be included. */
+const DENSE_CANDIDATES = 20;
+const SPARSE_CANDIDATES = 20;
+
+/** How far below the top fused score a passage may fall. */
 const RELATIVE_SCORE_GAP = 1 / (RRF_K + 3);
 
 export const NO_INFORMATION_MESSAGE =
   "The uploaded document does not contain enough information to answer this question.";
 
 export function cosineSimilarity(a: number[], b: number[]) {
-  let dot = 0,
-    am = 0,
-    bm = 0;
-  for (let i = 0; i < a.length; i++) {
+  let dot = 0;
+  let am = 0;
+  let bm = 0;
+
+  const length = Math.min(a.length, b.length);
+
+  for (let i = 0; i < length; i++) {
     dot += a[i] * b[i];
     am += a[i] * a[i];
     bm += b[i] * b[i];
   }
+
   return dot / (Math.sqrt(am) * Math.sqrt(bm) || 1);
 }
 
-function tokenize(value: string) {
+function tokenize(value: string): string[] {
   return [...new Set(value.toLowerCase().match(/[a-z0-9]{2,}/g) || [])];
 }
 
-function containsWord(text: string, term: string) {
-  return new RegExp(
-    `\\b${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
-    "i",
-  ).test(text);
+function termFrequency(term: string, text: string): number {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  return (text.match(new RegExp(`\\b${escaped}\\b`, "gi")) || []).length;
 }
 
-function termFrequency(term: string, text: string) {
-  return (text.match(new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi")) || [])
-    .length;
+export type BM25Index = {
+  documentCount: number;
+  averageDocumentLength: number;
+  documentFrequency: Map<string, number>;
+};
+
+export function buildBM25Index(chunks: Chunk[]): BM25Index {
+  if (!chunks.length) {
+    return {
+      documentCount: 0,
+      averageDocumentLength: 0,
+      documentFrequency: new Map(),
+    };
+  }
+
+  const documentFrequency = new Map<string, number>();
+
+  let totalLength = 0;
+
+  for (const chunk of chunks) {
+    totalLength += chunk.text.length;
+
+    const uniqueTerms = tokenize(chunk.text);
+
+    for (const term of uniqueTerms) {
+      documentFrequency.set(term, (documentFrequency.get(term) || 0) + 1);
+    }
+  }
+
+  return {
+    documentCount: chunks.length,
+    averageDocumentLength: totalLength / chunks.length,
+    documentFrequency,
+  };
 }
 
-function termDocumentFrequency(term: string, chunks: Chunk[]) {
-  return chunks.filter((chunk) => containsWord(chunk.text, term)).length;
-}
-
-/** Corpus BM25 — standard sparse retriever used in hybrid RAG pipelines. */
-export function bm25Score(query: string, text: string, chunks: Chunk[]) {
+export function bm25Score(
+  query: string,
+  text: string,
+  index: BM25Index,
+): number {
   const terms = tokenize(query);
-  if (!terms.length || !chunks.length) return 0;
 
-  const avgLength =
-    chunks.reduce((sum, chunk) => sum + chunk.text.length, 0) / chunks.length;
-  const docLength = text.length;
+  if (
+    !terms.length ||
+    index.documentCount === 0 ||
+    index.averageDocumentLength === 0
+  ) {
+    return 0;
+  }
+
   const k1 = 1.2;
   const b = 0.75;
 
-  let score = 0;
-  for (const term of terms) {
-    const df = termDocumentFrequency(term, chunks);
-    if (df === 0) continue;
+  const docLength = text.length;
 
-    const idf = Math.log((chunks.length - df + 0.5) / (df + 0.5) + 1);
+  const lengthNorm = 1 - b + (b * docLength) / index.averageDocumentLength;
+
+  let score = 0;
+
+  for (const term of terms) {
+    const df = index.documentFrequency.get(term) || 0;
+
+    if (df === 0) {
+      continue;
+    }
+
+    const idf = Math.log((index.documentCount - df + 0.5) / (df + 0.5) + 1);
+
     const tf = termFrequency(term, text);
-    const lengthNorm = 1 - b + (b * docLength) / avgLength;
+
+    if (tf === 0) {
+      continue;
+    }
+
     score += idf * ((tf * (k1 + 1)) / (tf + k1 * lengthNorm));
   }
 
   return score;
 }
 
-/** Reciprocal Rank Fusion — standard way to merge dense and sparse ranked lists. */
+function topK(scored: ScoredChunk[], k: number): ScoredChunk[] {
+  return scored.sort((a, b) => b.score - a.score).slice(0, k);
+}
+
+/**
+ * Reciprocal Rank Fusion — merges dense and sparse ranked lists.
+ */
 function reciprocalRankFusion(
   denseOrder: string[],
   sparseOrder: string[],
@@ -76,6 +136,7 @@ function reciprocalRankFusion(
   for (const [rank, id] of denseOrder.entries()) {
     fused.set(id, (fused.get(id) || 0) + 1 / (RRF_K + rank + 1));
   }
+
   for (const [rank, id] of sparseOrder.entries()) {
     fused.set(id, (fused.get(id) || 0) + 1 / (RRF_K + rank + 1));
   }
@@ -83,10 +144,21 @@ function reciprocalRankFusion(
   return fused;
 }
 
-/** True when at least one query term is present in the corpus index (BM25 > 0 somewhere). */
-export function queryMatchesCorpusIndex(query: string, chunks: Chunk[]) {
-  if (!tokenize(query).length || !chunks.length) return false;
-  return chunks.some((chunk) => bm25Score(query, chunk.text, chunks) > 0);
+export function queryMatchesCorpusIndex(
+  query: string,
+  chunks: Chunk[],
+): boolean {
+  const terms = tokenize(query);
+
+  if (!terms.length || !chunks.length) {
+    return false;
+  }
+
+  return chunks.some((chunk) => {
+    const chunkTerms = new Set(tokenize(chunk.text));
+
+    return terms.some((term) => chunkTerms.has(term));
+  });
 }
 
 export function retrieve(
@@ -95,25 +167,48 @@ export function retrieve(
   queryText: string,
   limit = 8,
 ): RetrievedSource[] {
-  const denseRanked = [...chunks].sort(
-    (a, b) =>
-      cosineSimilarity(b.embedding, queryEmbedding) -
-      cosineSimilarity(a.embedding, queryEmbedding),
-  );
-  const sparseRanked = [...chunks].sort(
-    (a, b) => bm25Score(queryText, b.text, chunks) - bm25Score(queryText, a.text, chunks),
+  if (!chunks.length) {
+    return [];
+  }
+
+  const bm25Index = buildBM25Index(chunks);
+
+  const denseScored: ScoredChunk[] = chunks.map((chunk) => ({
+    chunk,
+    score: cosineSimilarity(chunk.embedding, queryEmbedding),
+  }));
+
+  const denseTop = topK(denseScored, Math.min(DENSE_CANDIDATES, chunks.length));
+
+  const sparseScored: ScoredChunk[] = chunks.map((chunk) => ({
+    chunk,
+    score: bm25Score(queryText, chunk.text, bm25Index),
+  }));
+
+  const sparseTop = topK(
+    sparseScored,
+    Math.min(SPARSE_CANDIDATES, chunks.length),
   );
 
   const fused = reciprocalRankFusion(
-    denseRanked.map((chunk) => chunk.id),
-    sparseRanked.map((chunk) => chunk.id),
+    denseTop.map(({ chunk }) => chunk.id),
+    sparseTop.map(({ chunk }) => chunk.id),
+  );
+
+  const candidateIds = new Set(fused.keys());
+
+  const denseScores = new Map(
+    denseScored.map(({ chunk, score }) => [chunk.id, score]),
   );
 
   return chunks
+    .filter((chunk) => candidateIds.has(chunk.id))
     .map((chunk) => ({
       ...chunk,
       score: fused.get(chunk.id) || 0,
-      denseScore: cosineSimilarity(chunk.embedding, queryEmbedding),
+
+      denseScore: denseScores.get(chunk.id) || 0,
+
       sourceId: "",
     }))
     .sort((a, b) => b.score - a.score)
@@ -122,21 +217,28 @@ export function retrieve(
 
 export function filterRelevantCandidates(
   candidates: RetrievedSource[],
-  query: string,
-  allChunks: Chunk[],
+  _query?: string,
+  _allChunks?: Chunk[],
   limit = 5,
 ): RetrievedSource[] {
-  if (!candidates.length || !queryMatchesCorpusIndex(query, allChunks)) {
+  if (!candidates.length) {
     return [];
   }
 
   const topScore = candidates[0].score;
+
   const cutoff = topScore - RELATIVE_SCORE_GAP;
 
   return candidates
     .filter((candidate) => candidate.score >= cutoff)
     .slice(0, limit)
-    .map((source, index) => ({ ...source, sourceId: `Source ${index + 1}` }));
+    .map((source, index) => ({
+      ...source,
+      sourceId: `Source ${index + 1}`,
+    }))
+    .sort((a, b) =>
+      a.score === b.score ? b.denseScore - a.denseScore : b.score - a.score,
+    );
 }
 
 export function mergeRetrievedSources(
@@ -147,6 +249,7 @@ export function mergeRetrievedSources(
   for (const group of groups) {
     for (const source of group) {
       const existing = byId.get(source.id);
+
       if (!existing || source.score > existing.score) {
         byId.set(source.id, source);
       }
