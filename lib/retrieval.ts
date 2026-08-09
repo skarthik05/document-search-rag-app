@@ -1,5 +1,4 @@
-import { sort } from "next/dist/build/webpack/loaders/css-loader/src/utils";
-import type { Chunk, RetrievedSource, ScoredChunk } from "./types";
+import type { BM25Index, Chunk, RetrievedSource, ScoredChunk } from "./types";
 
 /** Reciprocal Rank Fusion constant. */
 const RRF_K = 60;
@@ -39,22 +38,16 @@ function termFrequency(term: string, text: string): number {
   return (text.match(new RegExp(`\\b${escaped}\\b`, "gi")) || []).length;
 }
 
-export type BM25Index = {
-  documentCount: number;
-  averageDocumentLength: number;
-  documentFrequency: Map<string, number>;
-};
-
 export function buildBM25Index(chunks: Chunk[]): BM25Index {
   if (!chunks.length) {
     return {
       documentCount: 0,
       averageDocumentLength: 0,
-      documentFrequency: new Map(),
+      documentFrequency: {},
     };
   }
 
-  const documentFrequency = new Map<string, number>();
+  const documentFrequency: Record<string, number> = {};
 
   let totalLength = 0;
 
@@ -64,7 +57,7 @@ export function buildBM25Index(chunks: Chunk[]): BM25Index {
     const uniqueTerms = tokenize(chunk.text);
 
     for (const term of uniqueTerms) {
-      documentFrequency.set(term, (documentFrequency.get(term) || 0) + 1);
+      documentFrequency[term] = (documentFrequency[term] || 0) + 1;
     }
   }
 
@@ -100,7 +93,7 @@ export function bm25Score(
   let score = 0;
 
   for (const term of terms) {
-    const df = index.documentFrequency.get(term) || 0;
+    const df = index.documentFrequency[term] || 0;
 
     if (df === 0) {
       continue;
@@ -165,13 +158,12 @@ export function retrieve(
   chunks: Chunk[],
   queryEmbedding: number[],
   queryText: string,
+  bm25Index: BM25Index,
   limit = 8,
 ): RetrievedSource[] {
-  if (!chunks.length) {
+  if (!chunks.length || !bm25Index || !bm25Index.documentFrequency) {
     return [];
   }
-
-  const bm25Index = buildBM25Index(chunks);
 
   const denseScored: ScoredChunk[] = chunks.map((chunk) => ({
     chunk,
@@ -217,8 +209,7 @@ export function retrieve(
 
 export function filterRelevantCandidates(
   candidates: RetrievedSource[],
-  _query?: string,
-  _allChunks?: Chunk[],
+  bm25Index: BM25Index,
   limit = 5,
 ): RetrievedSource[] {
   if (!candidates.length) {
@@ -231,14 +222,14 @@ export function filterRelevantCandidates(
 
   return candidates
     .filter((candidate) => candidate.score >= cutoff)
+    .sort((a, b) =>
+      a.score === b.score ? b.denseScore - a.denseScore : b.score - a.score,
+    )
     .slice(0, limit)
     .map((source, index) => ({
       ...source,
       sourceId: `Source ${index + 1}`,
-    }))
-    .sort((a, b) =>
-      a.score === b.score ? b.denseScore - a.denseScore : b.score - a.score,
-    );
+    }));
 }
 
 export function mergeRetrievedSources(

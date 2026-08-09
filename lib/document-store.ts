@@ -6,7 +6,9 @@ const KEY = "active-document";
 async function db() {
   return openDB(DB_NAME, 1, {
     upgrade(database) {
-      database.createObjectStore("documents");
+      if (!database.objectStoreNames.contains("documents")) {
+        database.createObjectStore("documents");
+      }
     },
   });
 }
