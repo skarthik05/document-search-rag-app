@@ -9,6 +9,7 @@ import {
 } from "../lib/document-store";
 import { extractChunks } from "../lib/extract-text";
 import {
+  buildBM25Index,
   filterRelevantCandidates,
   mergeRetrievedSources,
   NO_INFORMATION_MESSAGE,
@@ -129,13 +130,17 @@ export function DocumentSearchApp() {
           embedding: await embed(raw[i].text, "RETRIEVAL_DOCUMENT"),
         });
       }
-
+      const bm25Index =
+        buildBM25Index(
+          chunks,
+        );
       const next = {
         id: crypto.randomUUID(),
         filename: file.name,
         createdAt: Date.now(),
         expiresAt: Date.now() + 86400000,
         chunks,
+        bm25Index,
       };
 
       await saveActiveDocument(next);
@@ -175,7 +180,7 @@ export function DocumentSearchApp() {
       );
 
       let queryEmbedding = await embed(question, "RETRIEVAL_QUERY");
-      let candidates = retrieve(document.chunks, queryEmbedding, question, 8);
+      let candidates = retrieve(document.chunks, queryEmbedding, question, document.bm25Index, 8);
 
       if (mode === "agent") {
         let searchQuery = question;
@@ -189,9 +194,8 @@ export function DocumentSearchApp() {
 
           const seed = filterRelevantCandidates(
             candidates,
-            question,
-            document.chunks,
-            3,
+            document.bm25Index,
+            3
           );
           const { query: refined } = await request("/api/refine", {
             question: searchQuery,
@@ -207,15 +211,14 @@ export function DocumentSearchApp() {
           queryEmbedding = await embed(searchQuery, "RETRIEVAL_QUERY");
           candidates = mergeRetrievedSources(
             candidates,
-            retrieve(document.chunks, queryEmbedding, searchQuery, 8),
+            retrieve(document.chunks, queryEmbedding, searchQuery, document.bm25Index, 8),
           );
         }
       }
 
       let found = filterRelevantCandidates(
         candidates,
-        question,
-        document.chunks,
+        document.bm25Index,
       );
 
       if (currentSearch !== searchId.current) return;
