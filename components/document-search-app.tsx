@@ -14,13 +14,17 @@ import {
   mergeRetrievedSources,
   NO_INFORMATION_MESSAGE,
   retrieve,
+  retrievalImproved,
+  shouldStopAgentSearch,
 } from "../lib/retrieval";
 import type {
   RetrievedSource,
   SearchMode,
   StoredDocument,
 } from "../lib/types";
-
+function elapsed(start: number) {
+  return `${(performance.now() - start).toFixed(0)}ms`;
+}
 async function embed(
   input: string,
   taskType: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY"
@@ -178,47 +182,175 @@ export function DocumentSearchApp() {
           ? "Interpreting question and retrieving sources…"
           : "Retrieving relevant passages…",
       );
+      const searchStart = performance.now();
+      console.log("[search] started");
+      const embeddingStart = performance.now();
 
       let queryEmbedding = await embed(question, "RETRIEVAL_QUERY");
-      let candidates = retrieve(document.chunks, queryEmbedding, question, document.bm25Index, 8);
+      console.log(
+        `[search] embedding: ${elapsed(embeddingStart)}`,
+      );
+      const retrievalStart = performance.now();
 
+      let retrievalResult =
+        retrieve(
+          document.chunks,
+          queryEmbedding,
+          question,
+          document.bm25Index,
+          8,
+        );
+
+      let candidates =
+        retrievalResult.sources;
+      console.log(
+        `[search] retrieval: ${elapsed(retrievalStart)}`,
+      );
+
+      console.log(
+        `[search] total so far: ${elapsed(searchStart)}`,
+      );
       if (mode === "agent") {
         let searchQuery = question;
 
-        for (let round = 0; round < 2; round++) {
-          setStatus(
-            round === 0
-              ? "Refining search query…"
-              : "Refining search query again…",
-          );
 
-          const seed = filterRelevantCandidates(
-            candidates,
-            document.bm25Index,
-            3
-          );
-          const { query: refined } = await request("/api/refine", {
-            question: searchQuery,
-            sources: seed,
-          });
+        const MAX_RETRIEVAL_ATTEMPTS = 2;
 
-          const nextQuery = refined?.trim();
-          if (!nextQuery || nextQuery.toLowerCase() === searchQuery.toLowerCase()) {
+        for (
+          let attempt = 1;
+          attempt <
+          MAX_RETRIEVAL_ATTEMPTS;
+          attempt++
+        ) {
+
+          if (
+            shouldStopAgentSearch(
+              retrievalResult,
+            )
+          ) {
+            setStatus(
+              "✓ Retrieval evidence looks stable.",
+            );
+
             break;
           }
 
-          searchQuery = nextQuery;
-          queryEmbedding = await embed(searchQuery, "RETRIEVAL_QUERY");
-          candidates = mergeRetrievedSources(
-            candidates,
-            retrieve(document.chunks, queryEmbedding, searchQuery, document.bm25Index, 8),
+          setStatus(
+            "🔄 Refining search query…",
           );
+
+          const seed =
+            filterRelevantCandidates(
+              candidates,
+              3,
+            );
+
+          const refineStart =
+            performance.now();
+
+          const { query: refined } =
+            await request(
+              "/api/refine",
+              {
+                question: searchQuery,
+                sources: seed,
+              },
+            );
+
+          console.log(
+            `[agent] refine ${attempt}: ${performance.now() -
+            refineStart
+            }ms`,
+          );
+
+          const nextQuery =
+            refined?.trim();
+
+          if (
+            !nextQuery ||
+            nextQuery.toLowerCase() ===
+            searchQuery.toLowerCase()
+          ) {
+            break;
+          }
+
+          searchQuery =
+            nextQuery;
+
+          setStatus(
+            `🔍 Searching again with refined query: "${searchQuery}"`,
+          );
+
+          const embeddingStart =
+            performance.now();
+
+          queryEmbedding =
+            await embed(
+              searchQuery,
+              "RETRIEVAL_QUERY",
+            );
+
+          console.log(
+            `[agent] embedding ${attempt}: ${performance.now() -
+            embeddingStart
+            }ms`,
+          );
+
+          const nextResult =
+            retrieve(
+              document.chunks,
+              queryEmbedding,
+              searchQuery,
+              document.bm25Index,
+              8,
+            );
+
+          console.log(
+            `[agent] retrieval ${attempt}`,
+            nextResult.signal,
+          );
+
+          const improved =
+            retrievalImproved(
+              retrievalResult,
+              nextResult,
+            );
+
+          console.log(
+            `[agent] retrieval improved: ${improved}`,
+          );
+
+          if (!improved) {
+
+            break;
+          }
+
+
+          retrievalResult =
+            nextResult;
+
+          candidates =
+            nextResult.sources;
+
+          setStatus(
+            `🔍 Searching again - found ${candidates.length} candidate sections.`,
+          );
+          if (
+            shouldStopAgentSearch(
+              retrievalResult,
+            )
+          ) {
+            setStatus(
+              "✓ Evidence search complete.",
+            );
+
+            break;
+          }
         }
       }
-
       let found = filterRelevantCandidates(
         candidates,
-        document.bm25Index,
+        3
       );
 
       if (currentSearch !== searchId.current) return;
@@ -231,12 +363,14 @@ export function DocumentSearchApp() {
 
       if (mode !== "quick") {
         setStatus("Checking whether the document contains enough evidence…");
-
+        const relevanceStart = performance.now();
         const verdict = await request("/api/relevance", {
           question,
           sources: found,
         });
-
+        console.log(
+          `[search] relevance LLM: ${elapsed(relevanceStart)}`,
+        )
         found = found.filter((source) =>
           verdict.relevantSourceIds?.includes(source.sourceId),
         );
@@ -262,6 +396,7 @@ export function DocumentSearchApp() {
           ? "Generating a grounded summary…"
           : "Generating a grounded answer…",
       );
+      const answerStart = performance.now();
 
       const response = await fetch("/api/answer", {
         method: "POST",
@@ -274,7 +409,9 @@ export function DocumentSearchApp() {
           mode,
         }),
       });
-
+      console.log(
+        `[search] answer request: ${elapsed(answerStart)}`,
+      )
       if (!response.ok || !response.body) {
         const detail = await response.json().catch(() => null);
 

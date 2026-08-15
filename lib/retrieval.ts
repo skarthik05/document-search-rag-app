@@ -1,4 +1,10 @@
-import type { BM25Index, Chunk, RetrievedSource, ScoredChunk } from "./types";
+import type {
+  BM25Index,
+  Chunk,
+  RetrievalResult,
+  RetrievedSource,
+  ScoredChunk,
+} from "./types";
 
 /** Reciprocal Rank Fusion constant. */
 const RRF_K = 60;
@@ -118,7 +124,7 @@ function topK(scored: ScoredChunk[], k: number): ScoredChunk[] {
 }
 
 /**
- * Reciprocal Rank Fusion — merges dense and sparse ranked lists.
+ * Reciprocal Rank Fusion - merges dense and sparse ranked lists.
  */
 function reciprocalRankFusion(
   denseOrder: string[],
@@ -160,9 +166,25 @@ export function retrieve(
   queryText: string,
   bm25Index: BM25Index,
   limit = 8,
-): RetrievedSource[] {
+): RetrievalResult {
   if (!chunks.length || !bm25Index || !bm25Index.documentFrequency) {
-    return [];
+    return {
+      sources: [],
+      signal: {
+        topDenseScore: 0,
+        secondDenseScore: 0,
+        denseGap: 0,
+
+        topSparseScore: 0,
+        secondSparseScore: 0,
+        sparseGap: 0,
+
+        topFusedScore: 0,
+        candidateCount: 0,
+
+        topRankAgreement: false,
+      },
+    };
   }
 
   const denseScored: ScoredChunk[] = chunks.map((chunk) => ({
@@ -192,24 +214,82 @@ export function retrieve(
   const denseScores = new Map(
     denseScored.map(({ chunk, score }) => [chunk.id, score]),
   );
+  const sparseScores = new Map(
+    sparseTop.map(({ chunk, score }) => [chunk.id, score]),
+  );
+  console.log("[retrieval]", {
+    denseTopScore: denseTop[0]?.score,
+    denseSecondScore: denseTop[1]?.score,
 
-  return chunks
+    sparseTopScore: sparseTop[0]?.score,
+    sparseSecondScore: sparseTop[1]?.score,
+
+    fusedTopScore: fused.get(denseTop[0]?.chunk.id),
+
+    candidateCount: candidateIds.size,
+  });
+  const denseGap = (denseTop[0]?.score ?? 0) - (denseTop[1]?.score ?? 0);
+
+  const sparseGap = (sparseTop[0]?.score ?? 0) - (sparseTop[1]?.score ?? 0);
+  console.log({ denseGap, sparseGap });
+
+  const sources = chunks
     .filter((chunk) => candidateIds.has(chunk.id))
     .map((chunk) => ({
       ...chunk,
+
       score: fused.get(chunk.id) || 0,
 
       denseScore: denseScores.get(chunk.id) || 0,
+
+      sparseScore: sparseScores.get(chunk.id) || 0,
 
       sourceId: "",
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
+  const topDense = denseTop[0]?.score || 0;
+
+  const secondDense = denseTop[1]?.score || 0;
+
+  const topSparse = sparseTop[0]?.score || 0;
+
+  const secondSparse = sparseTop[1]?.score || 0;
+
+  const topDenseId = denseTop[0]?.chunk.id;
+
+  const topSparseId = sparseTop[0]?.chunk.id;
+
+  const signal = {
+    topDenseScore: topDense,
+    secondDenseScore: secondDense,
+
+    denseGap: topDense - secondDense,
+
+    topSparseScore: topSparse,
+    secondSparseScore: secondSparse,
+
+    sparseGap: topSparse - secondSparse,
+
+    topFusedScore: sources[0]?.score || 0,
+
+    candidateCount: candidateIds.size,
+
+    topRankAgreement: Boolean(
+      topDenseId && topSparseId && topDenseId === topSparseId,
+    ),
+  };
+
+  console.log("[retrieval signal]", signal);
+
+  return {
+    sources,
+    signal,
+  };
 }
 
 export function filterRelevantCandidates(
   candidates: RetrievedSource[],
-  bm25Index: BM25Index,
   limit = 5,
 ): RetrievedSource[] {
   if (!candidates.length) {
@@ -255,4 +335,110 @@ export function labelSources(sources: RetrievedSource[]): RetrievedSource[] {
     ...source,
     sourceId: `Source ${index + 1}`,
   }));
+}
+function sourceIdSet(sources: RetrievedSource[]): Set<string> {
+  return new Set(sources.map((source) => source.id));
+}
+
+function overlapRatio(a: RetrievedSource[], b: RetrievedSource[]): number {
+  if (!a.length || !b.length) {
+    return 0;
+  }
+
+  const aIds = sourceIdSet(a);
+
+  const intersection = b.filter((source) => aIds.has(source.id)).length;
+
+  const denominator = Math.max(a.length, b.length);
+
+  return intersection / denominator;
+}
+/**
+ * Determines whether the second retrieval actually
+ * produced meaningfully different evidence.
+ *
+ * This is intentionally based on relative change rather
+ * than an absolute cosine/BM25 threshold.
+ */
+export function retrievalImproved(
+  previous: RetrievalResult,
+  next: RetrievalResult,
+): boolean {
+  const previousTop = previous.signal.topFusedScore;
+
+  const nextTop = next.signal.topFusedScore;
+
+  /*
+   * New top result is useful evidence of improvement.
+   */
+  const previousTopId = previous.sources[0]?.id;
+
+  const nextTopId = next.sources[0]?.id;
+
+  if (nextTopId && nextTopId !== previousTopId && nextTop > previousTop) {
+    return true;
+  }
+
+  /*
+   * Same top result, but a meaningful score improvement.
+   *
+   * We deliberately use a relative comparison instead
+   * of hardcoding a model-specific score threshold.
+   */
+  if (previousTop > 0 && nextTop > previousTop * 1.05) {
+    return true;
+  }
+
+  /*
+   * Significant evidence-set change.
+   */
+  const overlap = overlapRatio(
+    previous.sources.slice(0, 5),
+    next.sources.slice(0, 5),
+  );
+
+  if (overlap < 0.6 && nextTop >= previousTop) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Cheap deterministic decision used by Agent Search.
+ *
+ * This does NOT mean "the question is answered."
+ * It only answers:
+ *
+ * "Do we have enough retrieval signal to stop
+ * spending time on more query reformulation?"
+ */
+export function shouldStopAgentSearch(result: RetrievalResult): boolean {
+  const sources = result.sources;
+  const { candidateCount, topRankAgreement } = result.signal;
+
+  if (!sources.length) {
+    return false;
+  }
+
+  /*
+   * Dense + sparse agree on the same top chunk.
+   *
+   * This is a strong retrieval stability signal.
+   */
+  if (topRankAgreement && candidateCount >= 2) {
+    return true;
+  }
+
+  /*
+   * Multiple stable candidates also give us a reason
+   * not to immediately spend another expensive LLM call.
+   *
+   * This is intentionally conservative.
+   */
+  if (sources.length >= 3 && candidateCount >= 3) {
+    return true;
+  }
+
+  return false;
 }
