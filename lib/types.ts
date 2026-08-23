@@ -57,3 +57,11 @@ export type RetrievalResult = {
   sources: RetrievedSource[];
   signal: RetrievalSignal;
 };
+
+export type RetrievalConfidenceLevel = "high" | "medium" | "low";
+
+export type RetrievalConfidence = {
+  level: RetrievalConfidenceLevel;
+  score: number;
+  reasons: string[];
+};

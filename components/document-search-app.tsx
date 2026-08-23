@@ -15,7 +15,9 @@ import {
   NO_INFORMATION_MESSAGE,
   retrieve,
   retrievalImproved,
-  shouldStopAgentSearch,
+  shouldStopQueryRefinement,
+  evaluateRetrievalConfidence,
+  shouldVerifyEvidence,
 } from "../lib/retrieval";
 import type {
   RetrievedSource,
@@ -210,6 +212,14 @@ export function DocumentSearchApp() {
       console.log(
         `[search] total so far: ${elapsed(searchStart)}`,
       );
+      let retrievalConfidence =
+        evaluateRetrievalConfidence(
+          retrievalResult,
+        );
+      console.log(
+        "[retrieval confidence]",
+        retrievalConfidence,
+      );
       if (mode === "agent") {
         let searchQuery = question;
 
@@ -224,7 +234,7 @@ export function DocumentSearchApp() {
         ) {
 
           if (
-            shouldStopAgentSearch(
+            shouldStopQueryRefinement(
               retrievalResult,
             )
           ) {
@@ -309,6 +319,15 @@ export function DocumentSearchApp() {
             `[agent] retrieval ${attempt}`,
             nextResult.signal,
           );
+          const nextConfidence =
+            evaluateRetrievalConfidence(
+              nextResult,
+            );
+
+          console.log(
+            "[agent] next retrieval confidence",
+            nextConfidence,
+          )
 
           const improved =
             retrievalImproved(
@@ -328,7 +347,8 @@ export function DocumentSearchApp() {
 
           retrievalResult =
             nextResult;
-
+          retrievalConfidence =
+            nextConfidence
           candidates =
             nextResult.sources;
 
@@ -336,7 +356,7 @@ export function DocumentSearchApp() {
             `🔍 Searching again - found ${candidates.length} candidate sections.`,
           );
           if (
-            shouldStopAgentSearch(
+            shouldStopQueryRefinement(
               retrievalResult,
             )
           ) {
@@ -362,23 +382,74 @@ export function DocumentSearchApp() {
       }
 
       if (mode !== "quick") {
-        setStatus("Checking whether the document contains enough evidence…");
-        const relevanceStart = performance.now();
-        const verdict = await request("/api/relevance", {
-          question,
-          sources: found,
-        });
+        const verifyEvidence =
+          shouldVerifyEvidence(
+            retrievalConfidence,
+          );
+
         console.log(
-          `[search] relevance LLM: ${elapsed(relevanceStart)}`,
-        )
-        found = found.filter((source) =>
-          verdict.relevantSourceIds?.includes(source.sourceId),
+          "[evidence]",
+          {
+            confidence:
+              retrievalConfidence.level,
+            score:
+              retrievalConfidence.score,
+            verifyEvidence,
+          },
         );
 
-        if (!verdict.hasEnoughInformation || !found.length) {
-          setAnswer(NO_INFORMATION_MESSAGE);
-          setStatus(NO_INFORMATION_MESSAGE);
-          return;
+        if (verifyEvidence) {
+          setStatus(
+            "Checking whether the document contains enough evidence…",
+          );
+
+          const relevanceStart =
+            performance.now();
+
+          const verdict =
+            await request(
+              "/api/relevance",
+              {
+                question,
+                sources: found,
+              },
+            );
+
+          console.log(
+            `[search] relevance LLM: ${performance.now() -
+            relevanceStart
+            }ms`,
+          );
+
+          found =
+            found.filter((source) =>
+              verdict.relevantSourceIds?.includes(
+                source.sourceId,
+              ),
+            );
+
+          if (
+            !verdict.hasEnoughInformation ||
+            !found.length
+          ) {
+            setAnswer(
+              NO_INFORMATION_MESSAGE,
+            );
+
+            setStatus(
+              NO_INFORMATION_MESSAGE,
+            );
+
+            return;
+          }
+        } else {
+          console.log(
+            "[evidence] skipped relevance LLM - high retrieval confidence",
+          );
+
+          setStatus(
+            "✓ Strong retrieval evidence found.",
+          );
         }
       }
 
@@ -587,7 +658,8 @@ export function DocumentSearchApp() {
                     {s.page ? ` · Page ${s.page}` : ""}
                   </strong>
 
-                  <span>Relevance: {(s.denseScore * 100).toFixed(1)}%</span>
+                  <span>Retrieved source
+                    Semantic match: {(s.denseScore * 100).toFixed(1)}%</span>
 
                   <p>{s.text}</p>
                 </li>
