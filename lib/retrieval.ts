@@ -1,6 +1,7 @@
 import type {
   BM25Index,
   Chunk,
+  RetrievalConfidence,
   RetrievalResult,
   RetrievedSource,
   ScoredChunk,
@@ -413,32 +414,157 @@ export function retrievalImproved(
  * "Do we have enough retrieval signal to stop
  * spending time on more query reformulation?"
  */
-export function shouldStopAgentSearch(result: RetrievalResult): boolean {
-  const sources = result.sources;
-  const { candidateCount, topRankAgreement } = result.signal;
-
-  if (!sources.length) {
-    return false;
-  }
+export function shouldStopQueryRefinement(result: RetrievalResult): boolean {
+  const confidence = evaluateRetrievalConfidence(result);
 
   /*
-   * Dense + sparse agree on the same top chunk.
-   *
-   * This is a strong retrieval stability signal.
+   * HIGH retrieval confidence means the current
+   * retrieval is strong enough that another query
+   * rewrite is unlikely to justify its latency.
    */
-  if (topRankAgreement && candidateCount >= 2) {
+  if (confidence.level === "high") {
     return true;
   }
 
   /*
-   * Multiple stable candidates also give us a reason
-   * not to immediately spend another expensive LLM call.
+   * Strong agreement between dense and sparse is
+   * also a useful stability signal.
    *
-   * This is intentionally conservative.
+   * We still require multiple candidates so that
+   * we're not trusting a single accidental match.
    */
-  if (sources.length >= 3 && candidateCount >= 3) {
+  if (
+    result.signal.topRankAgreement &&
+    result.signal.candidateCount >= 3 &&
+    result.signal.denseGap >= 0.02
+  ) {
     return true;
   }
 
   return false;
+}
+
+export function evaluateRetrievalConfidence(
+  result: RetrievalResult,
+): RetrievalConfidence {
+  const {
+    topDenseScore,
+    denseGap,
+    topSparseScore,
+    sparseGap,
+    candidateCount,
+    topRankAgreement,
+  } = result.signal;
+
+  let score = 0;
+  const reasons: string[] = [];
+
+  /*
+   * Dense similarity.
+   *
+   * We are deliberately using conservative thresholds.
+   * These are not "answer exists" thresholds.
+   */
+  if (topDenseScore >= 0.8) {
+    score += 2;
+    reasons.push("strong semantic similarity");
+  } else if (topDenseScore >= 0.7) {
+    score += 1;
+    reasons.push("reasonable semantic similarity");
+  } else {
+    reasons.push("weak semantic similarity");
+  }
+
+  /*
+   * Dense separation.
+   *
+   * A large gap means the best semantic result is
+   * more clearly distinguished from the next result.
+   */
+  if (denseGap >= 0.05) {
+    score += 2;
+    reasons.push("clear semantic ranking");
+  } else if (denseGap >= 0.02) {
+    score += 1;
+    reasons.push("moderate semantic ranking");
+  } else {
+    reasons.push("semantic results are close");
+  }
+
+  /*
+   * Sparse retrieval.
+   *
+   * We intentionally don't require BM25 to be strong because
+   * semantic queries may have little lexical overlap.
+   */
+  if (topSparseScore > 0) {
+    score += 1;
+    reasons.push("lexical evidence found");
+  }
+
+  if (sparseGap >= 2) {
+    score += 2;
+    reasons.push("clear lexical ranking");
+  } else if (sparseGap >= 0.5) {
+    score += 1;
+    reasons.push("moderate lexical ranking");
+  }
+
+  /*
+   * Agreement between dense and sparse retrieval
+   * is a useful stability signal.
+   */
+  if (topRankAgreement) {
+    score += 2;
+    reasons.push("semantic and lexical retrieval agree");
+  }
+
+  /*
+   * We want multiple candidates available for
+   * evidence verification.
+   */
+  if (candidateCount >= 3) {
+    score += 1;
+    reasons.push("multiple candidate passages available");
+  }
+
+  /*
+   * Confidence levels.
+   *
+   * IMPORTANT:
+   * This is retrieval confidence, NOT answerability.
+   */
+  let level: RetrievalConfidence["level"];
+
+  if (score >= 7) {
+    level = "high";
+  } else if (score >= 4) {
+    level = "medium";
+  } else {
+    level = "low";
+  }
+
+  return {
+    level,
+    score,
+    reasons,
+  };
+}
+export function shouldVerifyEvidence(confidence: RetrievalConfidence): boolean {
+  /*
+   * For now:
+   *
+   * HIGH confidence:
+   *   We trust retrieval enough to skip the
+   *   expensive verifier.
+   *
+   * MEDIUM / LOW:
+   *   Keep the verifier.
+   */
+  return confidence.level !== "high";
+}
+export function shouldAbstainFromRetrieval(
+  confidence: RetrievalConfidence,
+): boolean {
+  return confidence.level === "low";
 }
