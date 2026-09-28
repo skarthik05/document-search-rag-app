@@ -11,7 +11,6 @@ import { extractChunks } from "../lib/extract-text";
 import {
   buildBM25Index,
   filterRelevantCandidates,
-  mergeRetrievedSources,
   NO_INFORMATION_MESSAGE,
   retrieve,
   retrievalImproved,
