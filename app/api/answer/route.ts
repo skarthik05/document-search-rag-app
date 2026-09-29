@@ -1,12 +1,13 @@
-import { streamingAnswer } from "../../../lib/ai-provider";
+import { activeProvider, streamingAnswer } from "../../../lib/ai-provider";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 function readDelta(payload: unknown) {
   if (!payload || typeof payload !== "object") return "";
-  const data = payload as { delta?: string; candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-  return data.delta || data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
+  const data = payload as { delta?: string; response?: string; candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+  return data.delta || data.response || data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
+
 }
 
 export async function POST(request: Request) {
@@ -20,6 +21,7 @@ export async function POST(request: Request) {
     }
 
     const encoder = new TextEncoder(), decoder = new TextDecoder();
+    const isOllama = activeProvider() === "ollama";
     let buffer = "";
     const stream = new ReadableStream({
       async start(controller) {
@@ -29,6 +31,14 @@ export async function POST(request: Request) {
             const { value, done } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
+            if (isOllama) {
+              const lines = buffer.split(/\r?\n/); buffer = lines.pop() || "";
+              for (const line of lines) {
+                if (!line.trim()) continue;
+                try { const delta = readDelta(JSON.parse(line)); if (delta) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`)); } catch { /* malformed provider event */ }
+              }
+              continue;
+            }
             const events = buffer.split(/\r?\n\r?\n/); buffer = events.pop() || "";
             for (const event of events) {
               // Gemini formats one SSE JSON payload across several lines. Keep the
@@ -40,10 +50,12 @@ export async function POST(request: Request) {
               try { const delta = readDelta(JSON.parse(raw)); if (delta) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`)); } catch { /* incomplete/malformed provider event */ }
             }
           }
-          if (buffer.trim()) {
+          if (isOllama && buffer.trim()) {
+            try { const delta = readDelta(JSON.parse(buffer)); if (delta) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`)); } catch { /* malformed provider event */ }
+          } else if (buffer.trim()) {
             const dataStart = buffer.match(/^data:\s*/m);
             const raw = dataStart?.index === undefined ? undefined : buffer.slice(dataStart.index + dataStart[0].length).trim();
-            if (raw) { try { const delta = readDelta(JSON.parse(raw)); if (delta) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`)); } catch {} }
+            if (raw) { try { const delta = readDelta(JSON.parse(raw)); if (delta) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`)); } catch { } }
           }
           controller.close();
         } catch (error) { controller.error(error); }

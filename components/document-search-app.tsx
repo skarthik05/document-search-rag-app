@@ -16,7 +16,6 @@ import {
   retrievalImproved,
   shouldStopQueryRefinement,
   evaluateRetrievalConfidence,
-  shouldVerifyEvidence,
 } from "../lib/retrieval";
 import type {
   RetrievedSource,
@@ -367,7 +366,7 @@ export function DocumentSearchApp() {
           }
         }
       }
-      let found = filterRelevantCandidates(
+      const found = filterRelevantCandidates(
         candidates,
         3
       );
@@ -378,78 +377,6 @@ export function DocumentSearchApp() {
         setAnswer(NO_INFORMATION_MESSAGE);
         setStatus(NO_INFORMATION_MESSAGE);
         return;
-      }
-
-      if (mode !== "quick") {
-        const verifyEvidence =
-          shouldVerifyEvidence(
-            retrievalConfidence,
-          );
-
-        console.log(
-          "[evidence]",
-          {
-            confidence:
-              retrievalConfidence.level,
-            score:
-              retrievalConfidence.score,
-            verifyEvidence,
-          },
-        );
-
-        if (verifyEvidence) {
-          setStatus(
-            "Checking whether the document contains enough evidence…",
-          );
-
-          const relevanceStart =
-            performance.now();
-
-          const verdict =
-            await request(
-              "/api/relevance",
-              {
-                question,
-                sources: found,
-              },
-            );
-
-          console.log(
-            `[search] relevance LLM: ${performance.now() -
-            relevanceStart
-            }ms`,
-          );
-
-          found =
-            found.filter((source) =>
-              verdict.relevantSourceIds?.includes(
-                source.sourceId,
-              ),
-            );
-
-          if (
-            !verdict.hasEnoughInformation ||
-            !found.length
-          ) {
-            setAnswer(
-              NO_INFORMATION_MESSAGE,
-            );
-
-            setStatus(
-              NO_INFORMATION_MESSAGE,
-            );
-
-            return;
-          }
-        } else {
-          console.log(
-            "[evidence] skipped relevance LLM - high retrieval confidence",
-          );
-
-          setStatus(
-            "✓ Strong retrieval evidence found.",
-          );
-        }
       }
 
       setSources(found);
