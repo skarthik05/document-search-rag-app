@@ -1,20 +1,26 @@
 import type { RetrievedSource } from "./types";
 
-const provider = () =>
-  process.env.AI_PROVIDER?.trim().toLowerCase() === "openai"
-    ? "openai"
-    : "gemini";
+const provider = () => {
+  const configured = process.env.AI_PROVIDER?.trim().toLowerCase();
+  return configured === "openai" || configured === "gemini"
+    ? configured
+    : "ollama";
+};
 const key = () =>
-  provider() === "openai"
-    ? process.env.OPENAI_API_KEY
-    : process.env.GEMINI_API_KEY;
+  provider() === "openai" ? process.env.OPENAI_API_KEY : process.env.GEMINI_API_KEY;
+const ollamaBaseUrl = () =>
+  (process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434").replace(/\/$/, "");
+const ollamaEmbeddingModel = () =>
+  process.env.OLLAMA_EMBEDDING_MODEL?.trim() || "nomic-embed-text";
+const ollamaLlmModel = () => process.env.OLLAMA_LLM_MODEL?.trim() || "llama3.2";
 const geminiModel = () =>
   process.env.GEMINI_MODEL?.trim() || "gemini-3.6-flash";
 const noKey = () => {
-  if (!key())
+  if (provider() !== "ollama" && !key())
     throw new Error(
       `Missing ${provider() === "openai" ? "OPENAI_API_KEY" : "GEMINI_API_KEY"}. Add it to .env.local.`,
     );
+  console.log(`Using ${provider()} provider with model: ${provider() === "ollama" ? ollamaLlmModel() : provider() === "openai" ? "gpt-4.1-mini" : geminiModel()}`);
 };
 
 export async function embed(
@@ -22,6 +28,17 @@ export async function embed(
   taskType?: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY",
 ) {
   noKey();
+  if (provider() === "ollama") {
+    const response = await fetch(`${ollamaBaseUrl()}/api/embed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: ollamaEmbeddingModel(), input }),
+    });
+    const json = await response.json();
+    if (!response.ok)
+      throw new Error(json.error || "Ollama embedding failed");
+    return json.embeddings[0] as number[];
+  }
   if (provider() === "openai") {
     const response = await fetch("https://api.openai.com/v1/embeddings", {
       method: "POST",
@@ -68,7 +85,7 @@ function prompt(
     return `You help refine document search queries. Return ONLY a concise search query (no explanation) that will retrieve passages answering the user's question. Preserve the user's intent.${sourceBlock}\n\nUser question: ${question}`;
   }
   if (task === "verify")
-    return `You are a strict document-evidence verifier. Using ONLY the source passages below, decide whether they directly answer or materially support the user's question. Do not use outside knowledge. Return exactly valid JSON with this shape: {"hasEnoughInformation":true,"relevantSourceIds":["Source 1"]}. Set hasEnoughInformation to false and use an empty relevantSourceIds array when the document does not contain adequate evidence to answer the question.\n\nQuestion: ${question}\n\nSources:\n${context}`;
+    return `Determine whether the sources contain the answer to the question. If any source explicitly states the requested fact or directly supports it, set hasEnoughInformation to true and list that source's ID exactly as shown. Set it to false only when none of the sources contains evidence for an answer. Do not require extra details beyond what the question asks, and do not use outside knowledge. Return only a JSON object with the keys hasEnoughInformation (boolean) and relevantSourceIds (array of exact source ID strings). Do not include markdown or explanation.\n\nQuestion: ${question}\n\nSources:\n${context}`;
   if (task === "summary")
     return `Summarize only the relevant document passages below in relation to the user's question. Do not add facts, assumptions, or outside knowledge. Cite each factual statement with source labels like [Source 1]. If the passages do not contain enough information, say exactly: "The uploaded document does not contain enough information to answer this question."\n\nQuestion: ${question}\n\nSources:\n${context}`;
   return `Answer the question using ONLY the sources below. Cite claims with source labels like [Source 1]. If the sources do not contain enough information to answer the question, say exactly: "The uploaded document does not contain enough information to answer this question." Do not use outside knowledge.\n\nQuestion: ${question}\n\nSources:\n${context}`;
@@ -81,6 +98,41 @@ export async function complete(
 ) {
   noKey();
   const text = prompt(question, sources, task);
+  if (provider() === "ollama") {
+    const verificationFormat =
+      task === "verify"
+        ? {
+          type: "object",
+          properties: {
+            hasEnoughInformation: { type: "boolean" },
+            relevantSourceIds: {
+              type: "array",
+              items: {
+                type: "string",
+                enum: sources.map((source) => source.sourceId),
+              },
+            },
+          },
+          required: ["hasEnoughInformation", "relevantSourceIds"],
+          additionalProperties: false,
+        }
+        : undefined;
+    const response = await fetch(`${ollamaBaseUrl()}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: ollamaLlmModel(),
+        prompt: text,
+        stream: false,
+        ...(verificationFormat
+          ? { format: verificationFormat, options: { temperature: 0 } }
+          : {}),
+      }),
+    });
+    const json = await response.json();
+    if (!response.ok) throw new Error(json.error || "Ollama request failed");
+    return json.response as string;
+  }
   if (provider() === "openai") {
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -134,13 +186,13 @@ export async function verifyEvidence(
     };
     const relevantSourceIds = Array.isArray(value.relevantSourceIds)
       ? [
-          ...new Set(
-            value.relevantSourceIds
-              .filter((id): id is string => typeof id === "string")
-              .map(normalizeSourceId)
-              .filter((id): id is string => Boolean(id)),
-          ),
-        ]
+        ...new Set(
+          value.relevantSourceIds
+            .filter((id): id is string => typeof id === "string")
+            .map(normalizeSourceId)
+            .filter((id): id is string => Boolean(id)),
+        ),
+      ]
       : [];
     return {
       hasEnoughInformation:
@@ -159,6 +211,12 @@ export async function streamingAnswer(
 ) {
   noKey();
   const text = prompt(question, sources, task);
+  if (provider() === "ollama")
+    return fetch(`${ollamaBaseUrl()}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: ollamaLlmModel(), prompt: text, stream: true }),
+    });
   if (provider() === "openai")
     return fetch("https://api.openai.com/v1/responses", {
       method: "POST",

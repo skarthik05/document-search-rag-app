@@ -29,7 +29,7 @@ Before getting started, make sure you have:
 
 - Node.js 20+
 - pnpm
-- A Gemini or OpenAI API key
+- Ollama with the configured models, or an API key for Gemini or OpenAI
 - A modern browser with IndexedDB support
 
 ---
@@ -54,6 +54,26 @@ pnpm install
 ## Configure environment variables
 
 Create a `.env.local` file in the project root.
+
+### Using Ollama (default)
+
+Start Ollama and pull the models:
+
+```bash
+ollama pull nomic-embed-text
+ollama pull llama3.2
+```
+
+The application defaults to Ollama at `http://localhost:11434` with these models:
+
+```env
+AI_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+OLLAMA_LLM_MODEL=llama3.2
+```
+
+These are also the built-in defaults, so `AI_PROVIDER` and the model variables can be omitted when using the default local Ollama setup.
 
 ### Using Gemini
 
