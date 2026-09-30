@@ -21,8 +21,23 @@ import type {
   SearchMode,
   StoredDocument,
 } from "../lib/types";
-import type { ConversationTurn } from "../lib/conversation-types";
+import type { ConversationTurn, LongTermMemory } from "../lib/conversation-types";
+import {
+  addLongTermMemory,
+  clearConversation,
+  deleteLongTermMemory,
+  getConversation,
+  getLongTermMemories,
+  pruneExpiredConversations,
+  saveConversation,
+} from "../lib/memory-store";
+import {
+  MAX_ANSWER_CONTEXT_TURNS,
+  MAX_CONVERSATION_TURNS,
+  MAX_RETRIEVAL_CONTEXT_TURNS,
+} from "../lib/memory-limits";
 import { ConversationPanel, QuestionComposer } from "./conversation-ui";
+import { MemoryPanel } from "./memory-panel";
 function elapsed(start: number) {
   return `${(performance.now() - start).toFixed(0)}ms`;
 }
@@ -69,6 +84,7 @@ export function DocumentSearchApp() {
   const [document, setDocument] = useState<StoredDocument | null>(null);
   const [query, setQuery] = useState("");
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
+  const [longTermMemories, setLongTermMemories] = useState<LongTermMemory[]>([]);
   const [mode, setMode] = useState<SearchMode>("agent");
   const [pendingTurnId, setPendingTurnId] = useState<string | null>(null);
   const [openEvidence, setOpenEvidence] = useState<Record<string, boolean>>({});
@@ -80,7 +96,27 @@ export function DocumentSearchApp() {
   const searchId = useRef(0);
 
   useEffect(() => {
-    getActiveDocument().then(setDocument);
+    let cancelled = false;
+    async function restoreMemory() {
+      await pruneExpiredConversations();
+      const [activeDocument, memories] = await Promise.all([
+        getActiveDocument(),
+        getLongTermMemories(),
+      ]);
+      if (cancelled) return;
+
+      setDocument(activeDocument);
+      setLongTermMemories(memories);
+      if (activeDocument) {
+        setTurns(
+          await getConversation(activeDocument.id, activeDocument.expiresAt),
+        );
+      }
+    }
+    void restoreMemory();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function upload(file?: File) {
@@ -137,6 +173,7 @@ export function DocumentSearchApp() {
       };
 
       await saveActiveDocument(next);
+      if (document) await clearConversation(document.id);
 
       setDocument(next);
       setTurns([]);
@@ -155,6 +192,7 @@ export function DocumentSearchApp() {
   }
 
   function startNewConversation() {
+    if (document) void clearConversation(document.id);
     setTurns([]);
     setOpenEvidence({});
     setError("");
@@ -162,6 +200,7 @@ export function DocumentSearchApp() {
   }
 
   async function removeDocument() {
+    if (document) await clearConversation(document.id);
     await clearActiveDocument();
     setDocument(null);
     setTurns([]);
@@ -175,6 +214,18 @@ export function DocumentSearchApp() {
     const currentSearch = ++searchId.current;
     const question = query.trim();
     const turnId = crypto.randomUUID();
+    const recentTurns = turns
+      .filter((turn) => turn.mode !== "quick" && turn.answer.trim())
+      .slice(-MAX_ANSWER_CONTEXT_TURNS);
+    const retrievalContext = recentTurns
+      .slice(-MAX_RETRIEVAL_CONTEXT_TURNS)
+      .flatMap((turn) => [
+        `Previous question: ${turn.question}`,
+        `Previous answer: ${turn.answer.slice(0, 600)}`,
+      ]);
+    const retrievalQuery = retrievalContext.length
+      ? `${retrievalContext.join("\n")}\nCurrent question: ${question}`
+      : question;
 
     setBusy(true);
     setPendingTurnId(turnId);
@@ -184,7 +235,7 @@ export function DocumentSearchApp() {
     setTurns((current) => [
       ...current,
       { id: turnId, question, answer: "", sources: [], mode },
-    ]);
+    ].slice(-MAX_CONVERSATION_TURNS));
 
     const updateTurn = (updates: Partial<ConversationTurn>) => {
       setTurns((current) =>
@@ -204,7 +255,7 @@ export function DocumentSearchApp() {
       console.log("[search] started");
       const embeddingStart = performance.now();
 
-      let queryEmbedding = await embed(question, "RETRIEVAL_QUERY");
+      let queryEmbedding = await embed(retrievalQuery, "RETRIEVAL_QUERY");
       console.log(
         `[search] embedding: ${elapsed(embeddingStart)}`,
       );
@@ -214,7 +265,7 @@ export function DocumentSearchApp() {
         retrieve(
           document.chunks,
           queryEmbedding,
-          question,
+          retrievalQuery,
           document.bm25Index,
           8,
         );
@@ -237,7 +288,7 @@ export function DocumentSearchApp() {
         retrievalConfidence,
       );
       if (mode === "agent") {
-        let searchQuery = question;
+        let searchQuery = retrievalQuery;
 
 
         const MAX_RETRIEVAL_ATTEMPTS = 2;
@@ -392,17 +443,39 @@ export function DocumentSearchApp() {
       if (currentSearch !== searchId.current) return;
 
       if (!found.length) {
-        updateTurn({ answer: NO_INFORMATION_MESSAGE });
-        setStatus(NO_INFORMATION_MESSAGE);
+        const completedTurn: ConversationTurn = {
+          id: turnId,
+          question,
+          answer: NO_INFORMATION_MESSAGE,
+          sources: [],
+          mode,
+        };
+        updateTurn({ answer: completedTurn.answer });
+        await saveConversation(document.id, document.expiresAt, [
+          ...turns,
+          completedTurn,
+        ]);
+        setStatus("");
         return;
       }
 
       updateTurn({ sources: found });
 
       if (mode === "quick") {
-        updateTurn({
+        const completedTurn: ConversationTurn = {
+          id: turnId,
+          question,
           answer: `${found.length} relevant passage${found.length === 1 ? "" : "s"} found.`,
+          sources: found,
+          mode,
+        };
+        updateTurn({
+          answer: completedTurn.answer,
         });
+        await saveConversation(document.id, document.expiresAt, [
+          ...turns,
+          completedTurn,
+        ]);
         setStatus("");
         return;
       }
@@ -423,6 +496,11 @@ export function DocumentSearchApp() {
           question,
           sources: found,
           mode,
+          conversationHistory: recentTurns.map(({ question, answer }) => ({
+            question,
+            answer,
+          })),
+          longTermMemories: longTermMemories.map((memory) => memory.text),
         }),
       });
       console.log(
@@ -475,6 +553,17 @@ export function DocumentSearchApp() {
       }
 
       if (currentSearch === searchId.current) {
+        const completedTurn: ConversationTurn = {
+          id: turnId,
+          question,
+          answer: output,
+          sources: found,
+          mode,
+        };
+        await saveConversation(document.id, document.expiresAt, [
+          ...turns,
+          completedTurn,
+        ]);
         setStatus("");
       }
     } catch (e) {
@@ -517,6 +606,16 @@ export function DocumentSearchApp() {
           />
         </label>
       </section>
+
+      <MemoryPanel
+        memories={longTermMemories}
+        onAdd={async (text) => {
+          setLongTermMemories(await addLongTermMemory(text));
+        }}
+        onDelete={async (id) => {
+          setLongTermMemories(await deleteLongTermMemory(id));
+        }}
+      />
 
       <ConversationPanel
         turns={turns}
