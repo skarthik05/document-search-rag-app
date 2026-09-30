@@ -1,4 +1,8 @@
-import { activeProvider, streamingAnswer } from "../../../lib/ai-provider";
+import {
+  activeProvider,
+  requestCalculatorTool,
+  streamingAnswer,
+} from "../../../lib/ai-provider";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,12 +15,36 @@ function readDelta(payload: unknown) {
 }
 
 export async function POST(request: Request) {
+  const startedAt = Date.now();
   try {
     const { question, sources, mode } = await request.json();
-    const upstream = await streamingAnswer(question, sources, mode === "summary" ? "summary" : "answer");
+    const requestedTask = mode === "summary" ? "summary" : "answer";
+    console.info("[answer] request_started", {
+      provider: activeProvider(),
+      task: requestedTask,
+      sourceCount: Array.isArray(sources) ? sources.length : 0,
+    });
+    const calculatorResult = await requestCalculatorTool(question, sources)
+    const task = calculatorResult ? "answer" : requestedTask;
+    console.info("[answer] generation_task_selected", {
+      requestedTask,
+      task,
+      calculatorUsed: Boolean(calculatorResult),
+    });
+    const upstream = await streamingAnswer(
+      question,
+      sources,
+      task,
+      calculatorResult,
+    );
     if (!upstream.ok || !upstream.body) {
       const body = await upstream.text(); let message = "AI request failed";
       try { message = JSON.parse(body).error?.message || message; } catch { /* preserve fallback */ }
+      console.error("[answer] upstream_failed", {
+        provider: activeProvider(),
+        status: upstream.status,
+        durationMs: Date.now() - startedAt,
+      });
       return Response.json({ error: message }, { status: upstream.status || 500 });
     }
 
@@ -58,9 +86,26 @@ export async function POST(request: Request) {
             if (raw) { try { const delta = readDelta(JSON.parse(raw)); if (delta) controller.enqueue(encoder.encode(`data: ${JSON.stringify({ delta })}\n\n`)); } catch { } }
           }
           controller.close();
-        } catch (error) { controller.error(error); }
+          console.info("[answer] stream_completed", {
+            provider: activeProvider(),
+            durationMs: Date.now() - startedAt,
+          });
+        } catch (error) {
+          console.error("[answer] stream_failed", {
+            provider: activeProvider(),
+            durationMs: Date.now() - startedAt,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          controller.error(error);
+        }
       }
     });
     return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" } });
-  } catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Answer failed" }, { status: 500 }); }
+  } catch (error) {
+    console.error("[answer] request_failed", {
+      durationMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+    return Response.json({ error: error instanceof Error ? error.message : "Answer failed" }, { status: 500 });
+  }
 }
