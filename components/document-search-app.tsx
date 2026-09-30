@@ -18,10 +18,11 @@ import {
   evaluateRetrievalConfidence,
 } from "../lib/retrieval";
 import type {
-  RetrievedSource,
   SearchMode,
   StoredDocument,
 } from "../lib/types";
+import type { ConversationTurn } from "../lib/conversation-types";
+import { ConversationPanel, QuestionComposer } from "./conversation-ui";
 function elapsed(start: number) {
   return `${(performance.now() - start).toFixed(0)}ms`;
 }
@@ -64,25 +65,13 @@ async function request(path: string, body: unknown) {
   return j;
 }
 
-function renderAnswerWithCitations(answer: string) {
-  const parts = answer.split(/(\[Source \d+\])/g);
-  return parts.map((part, index) => {
-    const match = part.match(/^\[Source (\d+)\]$/);
-    if (!match) return part;
-    return (
-      <a key={index} href={`#source-${match[1]}`} className="citation">
-        {part}
-      </a>
-    );
-  });
-}
-
-
 export function DocumentSearchApp() {
   const [document, setDocument] = useState<StoredDocument | null>(null);
   const [query, setQuery] = useState("");
-  const [sources, setSources] = useState<RetrievedSource[]>([]);
-  const [answer, setAnswer] = useState("");
+  const [turns, setTurns] = useState<ConversationTurn[]>([]);
+  const [mode, setMode] = useState<SearchMode>("agent");
+  const [pendingTurnId, setPendingTurnId] = useState<string | null>(null);
+  const [openEvidence, setOpenEvidence] = useState<Record<string, boolean>>({});
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -150,8 +139,8 @@ export function DocumentSearchApp() {
       await saveActiveDocument(next);
 
       setDocument(next);
-      setSources([]);
-      setAnswer("");
+      setTurns([]);
+      setOpenEvidence({});
       setStatus("Document is ready for search.");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Upload failed");
@@ -165,16 +154,45 @@ export function DocumentSearchApp() {
     }
   }
 
+  function startNewConversation() {
+    setTurns([]);
+    setOpenEvidence({});
+    setError("");
+    setStatus("");
+  }
+
+  async function removeDocument() {
+    await clearActiveDocument();
+    setDocument(null);
+    setTurns([]);
+    setOpenEvidence({});
+    setStatus("Document removed.");
+  }
+
   async function search(mode: SearchMode) {
     if (!document || !query.trim()) return;
 
     const currentSearch = ++searchId.current;
     const question = query.trim();
+    const turnId = crypto.randomUUID();
 
     setBusy(true);
+    setPendingTurnId(turnId);
     setError("");
-    setAnswer("");
-    setSources([]);
+    setStatus("");
+    setQuery("");
+    setTurns((current) => [
+      ...current,
+      { id: turnId, question, answer: "", sources: [], mode },
+    ]);
+
+    const updateTurn = (updates: Partial<ConversationTurn>) => {
+      setTurns((current) =>
+        current.map((turn) =>
+          turn.id === turnId ? { ...turn, ...updates } : turn,
+        ),
+      );
+    };
 
     try {
       setStatus(
@@ -374,17 +392,18 @@ export function DocumentSearchApp() {
       if (currentSearch !== searchId.current) return;
 
       if (!found.length) {
-        setAnswer(NO_INFORMATION_MESSAGE);
+        updateTurn({ answer: NO_INFORMATION_MESSAGE });
         setStatus(NO_INFORMATION_MESSAGE);
         return;
       }
 
-      setSources(found);
+      updateTurn({ sources: found });
 
       if (mode === "quick") {
-        setStatus(
-          `${found.length} relevant passage${found.length === 1 ? "" : "s"} found.`,
-        );
+        updateTurn({
+          answer: `${found.length} relevant passage${found.length === 1 ? "" : "s"} found.`,
+        });
+        setStatus("");
         return;
       }
 
@@ -447,7 +466,7 @@ export function DocumentSearchApp() {
 
             if (data.delta) {
               output += data.delta;
-              setAnswer(output);
+              updateTurn({ answer: output });
             }
           } catch {
             /* malformed stream chunk */
@@ -456,164 +475,81 @@ export function DocumentSearchApp() {
       }
 
       if (currentSearch === searchId.current) {
-        setStatus(
-          mode === "summary" ? "Summary complete." : "Answer complete.",
-        );
+        setStatus("");
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Search failed");
+      const message = e instanceof Error ? e.message : "Search failed";
+      setError(message);
+      updateTurn({ answer: "I couldn't complete that response." });
       setStatus("");
     } finally {
       setBusy(false);
+      setPendingTurnId(null);
     }
   }
 
   return (
-    <div className="shell">
-      <header>
+    <main className="shell">
+      <header className="app-header">
         <p className="eyebrow">DOCUMENT-GROUNDED AI</p>
-
-        <h1>Search your document, with sources.</h1>
-
-        <p className="muted">
-          One active .txt or text-based PDF, retained in this browser for 24
-          hours.
-        </p>
+        <h1>Ask your documents.</h1>
+        <p className="muted">Answers stay tied to the active document and its sources.</p>
       </header>
 
-      <section className="card upload">
-        <div>
-          <strong>
-            {document ? document.filename : "No document uploaded"}
-          </strong>
-
-          <p>
-            {document
-              ? `Expires ${new Date(
-                document.expiresAt
-              ).toLocaleString()}`
-              : "Upload a document to begin."}
-          </p>
+      <section className="upload-bar" aria-label="Active document">
+        <div className="document-info">
+          <span className="upload-label">ACTIVE DOCUMENT</span>
+          <strong>{document?.filename || "No document uploaded"}</strong>
+          {document && (
+            <span className="expiry">
+              Expires {new Date(document.expiresAt).toLocaleString()}
+            </span>
+          )}
         </div>
-
-        <label className="button secondary">
+        <label className="button upload-button">
           {document ? "Replace document" : "Upload document"}
-
           <input
             ref={input}
             type="file"
             accept=".txt,.pdf,text/plain,application/pdf"
             hidden
-            onChange={(e) => upload(e.target.files?.[0])}
+            onChange={(event) => upload(event.target.files?.[0])}
           />
         </label>
       </section>
 
-      <section className="card">
-        <textarea
-          rows={3}
-          value={query}
-          disabled={!document || busy}
-          placeholder="Ask a question about the active document…"
-          onChange={(e) => setQuery(e.target.value)}
-        />
+      <ConversationPanel
+        turns={turns}
+        pendingTurnId={pendingTurnId}
+        status={status}
+        error={error}
+        openEvidence={openEvidence}
+        busy={busy}
+        documentName={document?.filename}
+        onNewConversation={startNewConversation}
+        onCitationClick={(turnId) =>
+          setOpenEvidence((current) => ({ ...current, [turnId]: true }))
+        }
+        onEvidenceToggle={(turnId, open) =>
+          setOpenEvidence((current) => ({ ...current, [turnId]: open }))
+        }
+      />
 
-        <div className="actions">
-          <button
-            disabled={!document || !query.trim() || busy}
-            onClick={() => search("quick")}
-          >
-            Quick search
-          </button>
-
-          <button
-            disabled={!document || !query.trim() || busy}
-            onClick={() => search("summary")}
-          >
-            Search & summarize
-          </button>
-
-          <button
-            disabled={!document || !query.trim() || busy}
-            onClick={() => search("agent")}
-          >
-            Agent search
-          </button>
-        </div>
-      </section>
-
-      {(status || error) && (
-        <p className={error ? "notice error" : "notice"}>
-          {error || status}
-        </p>
-      )}
-
-      <section className="grid">
-        <article className="card output">
-          <div className="panel-title">
-            <h2>LLM output</h2>
-
-            {answer && (
-              <button
-                className="copy"
-                onClick={() =>
-                  navigator.clipboard.writeText(answer)
-                }
-              >
-                Copy
-              </button>
-            )}
-          </div>
-
-          <p className={answer ? "answer" : "muted"}>
-            {answer
-              ? renderAnswerWithCitations(answer)
-              : "A grounded response will appear here."}
-          </p>
-        </article>
-
-        <article className="card">
-          <h2>Retrieved documents</h2>
-
-          {sources.length ? (
-            <ol className="sources">
-              {sources.map((s) => (
-                <li key={s.id} id={s.sourceId.replace(/\s+/g, "-").toLowerCase()}>
-                  <strong>
-                    [{s.sourceId}] {document?.filename}
-                    {s.page ? ` · Page ${s.page}` : ""}
-                  </strong>
-
-                  <span>Retrieved source
-                    Semantic match: {(s.denseScore * 100).toFixed(1)}%</span>
-
-                  <p>{s.text}</p>
-                </li>
-              ))}
-            </ol>
-          ) : (
-            <p className="muted">
-              Matching passages will appear here.
-            </p>
-          )}
-        </article>
-      </section>
+      <QuestionComposer
+        query={query}
+        mode={mode}
+        documentName={document?.filename}
+        busy={busy}
+        onQueryChange={setQuery}
+        onModeChange={setMode}
+        onSubmit={() => search(mode)}
+      />
 
       {document && (
-        <button
-          className="clear"
-          onClick={async () => {
-            await clearActiveDocument();
-
-            setDocument(null);
-            setSources([]);
-            setAnswer("");
-            setStatus("Document removed.");
-          }}
-        >
+        <button className="remove-document" onClick={removeDocument}>
           Remove active document
         </button>
       )}
-    </div>
+    </main>
   );
 }
