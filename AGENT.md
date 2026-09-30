@@ -25,6 +25,17 @@ web search
 
 Add memory
 
+Memory fundamentals
+- Conversation history is short-term context for the current session; durable memory is selected information intentionally retained across sessions. They are related but are not the same feature.
+- Store only information that improves future interactions: initially a bounded set of recent user/assistant turns; later, explicit user preferences or user-confirmed durable facts with provenance and timestamps.
+- Do not treat full uploaded documents as memory because document retrieval already owns that data. Avoid retaining secrets, unconfirmed model inferences, and unlimited transcripts by default.
+- Implemented short-term memory: retain the last 10 completed turns per active document in IndexedDB, expiring with the document after 24 hours. Send at most the latest 5 turns to retrieval and answer generation; document claims still require current retrieved evidence.
+- Memory quality rule: source-only turns such as "3 relevant passages found" stay visible in the transcript but are excluded from follow-up retrieval and model conversation context; they are UI status, not conversational answers.
+- Calculator routing: check for arithmetic results independently of answer/summary selection; a successful calculation uses concise answer generation, while a summary with no calculation remains a summary.
+- Implemented long-term memory: users explicitly add and delete preferences or facts in a saved-memory panel. Entries persist in this browser until deleted; the latest 30 are sent to the configured AI provider with a question and are not treated as evidence about uploaded documents.
+- Q&A UI learning: a transcript makes follow-up questions legible, keeps citations beside each answer, and lets users inspect retrieved evidence on demand. New conversation clears short-term history but leaves user-managed long-term memory intact.
+- UI maintenance: shared conversation types live in `lib/conversation-types.ts`; active search progress is shown once in the pending answer, while global notices are for upload work and errors.
+
 conversation history
 user preferences
 basic persistence

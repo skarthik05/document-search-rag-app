@@ -1,0 +1,3 @@
+export const MAX_CONVERSATION_TURNS = 10;
+export const MAX_RETRIEVAL_CONTEXT_TURNS = 2;
+export const MAX_ANSWER_CONTEXT_TURNS = 5;

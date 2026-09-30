@@ -20,6 +20,7 @@ The goal is not to hide retrieval behind a vector database or framework. The imp
 10. Optionally verify whether the retrieved evidence is sufficient.
 11. Generate a grounded response with source citations.
 12. For Agent Search, iteratively refine the search query and retrieve again.
+13. Keep bounded per-document conversation history and user-approved memories locally in the browser.
 
 ---
 
@@ -269,11 +270,20 @@ app/
 
 lib/
 ├── ai-provider.ts
+├── app-db.ts
 ├── chunking.ts
+├── conversation-types.ts
 ├── document-store.ts
 ├── extract-text.ts
+├── memory-limits.ts
+├── memory-store.ts
 ├── retrieval.ts
 └── types.ts
+
+components/
+├── conversation-ui.tsx
+├── document-search-app.tsx
+└── memory-panel.tsx
 ```
 
 ## Development philosophy
@@ -292,4 +302,10 @@ The documents are intentionally kept separate instead of turning the README into
 
 ## Project history
 
-See [`docs/`](./docs) for the evolution of the application.
+The `docs/` directory is the engineering history of the project. Each numbered document explains the problem, the concept introduced, and the resulting system change; diagrams are included when they clarify a flow or boundary. Keep this learning history in separate documents instead of expanding the README into a changelog.
+
+- [00 - Initial MVP](./docs/00-initial-mvp.md)
+- [01 - Retrieval performance](./docs/01-retrieval-performance.md)
+- [02 - Agent search and adaptive query refinement](./docs/02-agent-search-adaptive-query-refinement.md)
+- [03 - Retrieval confidence and adaptive evidence verification](./docs/03-retrieval-confidence-and-adaptive-evidence-verification.md)
+- [05 - Conversation history and user memory](./docs/05-conversation-and-user-memory.md)

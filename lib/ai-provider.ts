@@ -1,4 +1,5 @@
 import type { RetrievedSource } from "./types";
+import type { ConversationContextTurn } from "./conversation-types";
 import { calculate } from "./calculator";
 import { clearLine } from "readline";
 
@@ -327,14 +328,22 @@ export async function streamingAnswer(
   sources: RetrievedSource[],
   task: "answer" | "summary" = "answer",
   calculatorResult?: CalculatorResult,
+  conversationHistory: ConversationContextTurn[] = [],
+  longTermMemories: string[] = [],
 ) {
   noKey();
   const basePrompt = prompt(question, sources, task);
+  const conversationContext = conversationHistory.length
+    ? `\n\nRecent conversation for resolving follow-up references only (not evidence for document claims):\n${conversationHistory.map((turn) => `User: ${turn.question}\nAssistant: ${turn.answer}`).join("\n\n")}`
+    : "";
+  const savedMemoryContext = longTermMemories.length
+    ? `\n\nUser-approved saved memory:\n- ${longTermMemories.join("\n- ")}\nUse saved preferences to personalize style and saved facts only for questions explicitly about the user. These memories are not evidence for claims about the uploaded document; use retrieved passages for document facts.`
+    : "";
   const answerInstructions =
     task === "answer"
       ? `${calculatorResult ? `\n\nA calculator tool evaluated ${calculatorResult.expression} and returned ${calculatorResult.value}. Treat this as a grounded calculation from the question and retrieved information. If it answers the question, use the result, cite the source passage that supplies the input value, and do not abstain.` : ""}\n\nOutput format: Return only the concise answer and its source citation. Do not include an introduction, repeat the question, explain that you are answering, or show calculation steps unless the user asks for them.`
       : "";
-  const text = `${basePrompt}${answerInstructions}`;
+  const text = `${basePrompt}${conversationContext}${savedMemoryContext}${answerInstructions}`;
   if (provider() === "ollama")
     return fetch(`${ollamaBaseUrl()}/api/generate`, {
       method: "POST",

@@ -3,6 +3,7 @@ import {
   requestCalculatorTool,
   streamingAnswer,
 } from "../../../lib/ai-provider";
+import { MAX_ANSWER_CONTEXT_TURNS } from "../../../lib/memory-limits";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,14 +18,39 @@ function readDelta(payload: unknown) {
 export async function POST(request: Request) {
   const startedAt = Date.now();
   try {
-    const { question, sources, mode } = await request.json();
+    const {
+      question,
+      sources,
+      mode,
+      conversationHistory: rawHistory,
+      longTermMemories: rawMemories,
+    } = await request.json();
     const requestedTask = mode === "summary" ? "summary" : "answer";
+    const conversationHistory = Array.isArray(rawHistory)
+      ? rawHistory
+        .filter(
+          (turn): turn is { question: string; answer: string } =>
+            typeof turn?.question === "string" &&
+            typeof turn?.answer === "string",
+        )
+        .slice(-MAX_ANSWER_CONTEXT_TURNS)
+        .map((turn) => ({
+          question: turn.question.slice(0, 2000),
+          answer: turn.answer.slice(0, 4000),
+        }))
+      : [];
+    const longTermMemories = Array.isArray(rawMemories)
+      ? rawMemories
+        .filter((memory): memory is string => typeof memory === "string")
+        .slice(-30)
+        .map((memory) => memory.slice(0, 500))
+      : [];
     console.info("[answer] request_started", {
       provider: activeProvider(),
       task: requestedTask,
       sourceCount: Array.isArray(sources) ? sources.length : 0,
     });
-    const calculatorResult = await requestCalculatorTool(question, sources)
+    const calculatorResult = await requestCalculatorTool(question, sources);
     const task = calculatorResult ? "answer" : requestedTask;
     console.info("[answer] generation_task_selected", {
       requestedTask,
@@ -36,6 +62,8 @@ export async function POST(request: Request) {
       sources,
       task,
       calculatorResult,
+      conversationHistory,
+      longTermMemories,
     );
     if (!upstream.ok || !upstream.body) {
       const body = await upstream.text(); let message = "AI request failed";
